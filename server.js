@@ -123,7 +123,7 @@ const callOpenAi = async (prompt) => {
   console.log("CALLING OPENAI...");
 
   const response = await client.responses.create({
-    model: "gpt-4o-mini",
+    model: "gpt-4.1-nano",
     input: [
       {
         role: "user",
@@ -1756,38 +1756,20 @@ function calculateStreak(attempts) {
   return streak;
 }
 
+// Replace existing /api/progress with this upgraded, no-pagination handler
 app.get("/api/progress", protect, async (req, res) => {
   try {
     const userId = req.user.id;
-    const profile = req.profile;
+    const profile = req.profile || {};
 
-    /* ================= FETCH DATA ================= */
-
-    const { data: exerciseAttempts = [] } = await req.supabase
-      .from("exercise_attempts")
-      .select("score,total,created_at,exercises(subject)");
-
-    const { data: examAttempts = [] } = await req.supabase
-      .from("exam_attempts")
-      .select("score,total,created_at,exam_id");
-
-    const { data: exams = [] } = await req.supabase
-      .from("exams")
-      .select("id, subject");
-
-    /* ================= PROFILE SUBJECTS ================= */
-
-    // profile.subjects = "maths,english,hindi,science,physics,chemistry"
-    const rawSubjects = (profile.subjects || "")
-      .split(",")
-      .map(s => s.trim().toLowerCase())
-      .filter(Boolean)
-      .slice(0, 6); // hard limit: max 6 subjects
-
+    // Subject mapping (best-effort for nicer labels). Not required; falls back to raw subject.
     const SUBJECT_LABEL_MAP = {
       maths: "Mathematics",
       math: "Mathematics",
+      mathematics: "Mathematics",
+      eng: "English",
       english: "English",
+      sci: "Science",
       science: "Science",
       hindi: "Hindi",
       physics: "Physics",
@@ -1798,182 +1780,266 @@ app.get("/api/progress", protect, async (req, res) => {
     };
 
     const COLOR_PALETTE = [
-      "#6366f1", // indigo
-      "#8b5cf6", // violet
-      "#3b82f6", // blue
-      "#22c55e", // green
-      "#f59e0b", // amber
-      "#ef4444"  // red
+      "#6366f1", "#8b5cf6", "#3b82f6", "#22c55e", "#f59e0b", "#ef4444"
     ];
 
-    const SUBJECT_KEY_TO_LABEL = {};
-    const SUBJECT_LABEL_TO_COLOR = {};
-
-    rawSubjects.forEach((key, index) => {
-      const label =
-        SUBJECT_LABEL_MAP[key] ||
-        key.charAt(0).toUpperCase() + key.slice(1);
-
-      SUBJECT_KEY_TO_LABEL[key] = label;
-      SUBJECT_LABEL_TO_COLOR[label] =
-        COLOR_PALETTE[index % COLOR_PALETTE.length];
-    });
-
-    /* ================= USER ================= */
-
-    const user = {
-      id: userId,
-      name: `${profile.first_name} ${profile.last_name}`,
-      class: String(profile.class_level ?? ""),
-      board: profile.board ?? ""
+    const toLabel = (raw) => {
+      if (!raw) return null;
+      const k = String(raw).trim();
+      const key = k.toLowerCase();
+      return SUBJECT_LABEL_MAP[key] || (k.charAt(0).toUpperCase() + k.slice(1));
     };
 
-    /* ================= STATS ================= */
+    // Fetch all relevant data for this user
+    const [{ data: exerciseAttempts = [] }, { data: examAttempts = [] }, { data: studyActivities = [] }] = await Promise.all([
+      req.supabase
+        .from("exercise_attempts")
+        .select(`
+          id,
+          score,
+          total,
+          created_at,
+          details,
+          exercise_id,
+          duration_minutes,
+          duration_seconds,
+          exercises ( subject )
+        `)
+        .eq("user_id", userId),
+      req.supabase
+        .from("exam_attempts")
+        .select(`
+          id,
+          score,
+          total,
+          created_at,
+          exam_id,
+          duration_minutes,
+          duration_seconds
+        `)
+        .eq("user_id", userId),
+      req.supabase
+        .from("study_activity")
+        .select(`id, subject, score, total, activity_date, duration_minutes, duration_seconds`)
+        .eq("user_id", userId)
+    ]);
 
-    const allAttempts = [...exerciseAttempts, ...examAttempts];
+    // Map exam_id -> subject in bulk
+    const examIds = Array.from(new Set((examAttempts || []).map(e => e.exam_id).filter(Boolean)));
+    let examsById = {};
+    if (examIds.length) {
+      const { data: exams = [] } = await req.supabase
+        .from("exams")
+        .select("id, subjects")
+        .in("id", examIds);
 
-    const totalScore = allAttempts.reduce((s, a) => s + (a.score ?? 0), 0);
-    const totalMax = allAttempts.reduce((s, a) => s + (a.total ?? 0), 0);
+      examsById = (exams || []).reduce((acc, ex) => {
+        const subj = Array.isArray(ex.subjects) ? (ex.subjects[0] || null) : (ex.subjects || null);
+        acc[ex.id] = subj;
+        return acc;
+      }, {});
+    }
 
-    const averageScore =
-      totalMax > 0 ? Math.round((totalScore / totalMax) * 100) : 0;
+    // Helper: read duration from row (minutes) or return null
+    const normalizeDurationMinutes = (row) => {
+      if (row == null) return null;
+      if (row.duration_minutes != null) return Number(row.duration_minutes);
+      if (row.duration_seconds != null) return Number(row.duration_seconds) / 60;
+      return null;
+    };
 
-    const learningMinutes =
-      exerciseAttempts.length * 5 + examAttempts.length * 15;
+    // Normalize attempts into unified list
+    const normalizedAttempts = [];
 
-    const learningHours = Number((learningMinutes / 60).toFixed(2));
+    // Exercises
+    for (const a of exerciseAttempts || []) {
+      const subjRaw = a.exercises?.subject || null;
+      const label = subjRaw ? toLabel(subjRaw) : null;
+      normalizedAttempts.push({
+        kind: "exercise",
+        subjectRaw: subjRaw,
+        subjectLabel: label,
+        score: Number(a.score ?? 0),
+        total: Number(a.total ?? 0) || 0,
+        date: a.created_at ? new Date(a.created_at) : new Date(),
+        durationMinutes: normalizeDurationMinutes(a)
+      });
+    }
 
-    const uniqueDays = new Set(
-      allAttempts.map(a => new Date(a.created_at).toDateString())
-    ).size;
+    // Exams
+    for (const a of examAttempts || []) {
+      const subjRaw = examsById[a.exam_id] || null;
+      const label = subjRaw ? toLabel(subjRaw) : null;
+      normalizedAttempts.push({
+        kind: "exam",
+        subjectRaw: subjRaw,
+        subjectLabel: label,
+        score: Number(a.score ?? 0),
+        total: Number(a.total ?? 0) || 0,
+        date: a.created_at ? new Date(a.created_at) : new Date(),
+        durationMinutes: normalizeDurationMinutes(a)
+      });
+    }
 
+    // Study activities
+    for (const a of studyActivities || []) {
+      const subjRaw = a.subject || null;
+      const label = subjRaw ? toLabel(subjRaw) : null;
+      const date = a.activity_date ? new Date(a.activity_date) : new Date();
+      normalizedAttempts.push({
+        kind: "activity",
+        subjectRaw: subjRaw,
+        subjectLabel: label,
+        score: Number(a.score ?? 0),
+        total: Number(a.total ?? 0) || 0,
+        date,
+        durationMinutes: normalizeDurationMinutes(a)
+      });
+    }
+
+    // Determine subject list: prefer profile.subjects, else gather from attempts
+    let rawSubjects = [];
+    if (profile.subjects) {
+      rawSubjects = String(profile.subjects || "")
+        .split(",")
+        .map(s => s.trim())
+        .filter(Boolean);
+    }
+    if (rawSubjects.length === 0) {
+      rawSubjects = Array.from(new Set(normalizedAttempts.map(a => a.subjectRaw).filter(Boolean)));
+    }
+
+    // Map subjects -> attempts
+    const subjectAttemptsMap = {};
+    for (const a of normalizedAttempts) {
+      const label = a.subjectLabel || (a.subjectRaw ? toLabel(a.subjectRaw) : null);
+      if (!label) continue;
+      subjectAttemptsMap[label] ??= [];
+      subjectAttemptsMap[label].push(a);
+    }
+
+    // Sort each subject's attempts by date ascending (old -> new)
+    for (const label of Object.keys(subjectAttemptsMap)) {
+      subjectAttemptsMap[label].sort((x, y) => new Date(x.date) - new Date(y.date));
+    }
+
+    // Build subjects object with full trend (all attempts)
+    const subjects = {}; // label -> { average_score, exercises, exams, trend }
+    let paletteIndex = 0;
+    for (const label of Object.keys(subjectAttemptsMap)) {
+      const arr = subjectAttemptsMap[label];
+      const trend = arr.map(item => (item.total > 0 ? Math.round((item.score / item.total) * 100) : 0));
+      const exercisesCount = arr.filter(x => x.kind === "exercise").length;
+      const examsCount = arr.filter(x => x.kind === "exam").length;
+      const avgScore = trend.length ? Math.round(trend.reduce((s, v) => s + v, 0) / trend.length) : 0;
+
+      subjects[label] = {
+        average_score: avgScore,
+        exercises: exercisesCount,
+        exams: examsCount,
+        trend
+      };
+
+      paletteIndex++;
+    }
+
+    // Ensure subjects from profile are present even if empty
+    for (const raw of rawSubjects) {
+      const label = toLabel(raw);
+      if (!label) continue;
+      if (!subjects[label]) {
+        subjects[label] = { average_score: 0, exercises: 0, exams: 0, trend: [] };
+      }
+    }
+
+    // Overall stats
+    const totalScore = normalizedAttempts.reduce((s, a) => s + (a.score || 0), 0);
+    const totalMax = normalizedAttempts.reduce((s, a) => s + (a.total || 0), 0);
+    const averageScore = totalMax > 0 ? Math.round((totalScore / totalMax) * 100) : 0;
+
+    const exercisesDone = normalizedAttempts.filter(a => a.kind === "exercise").length;
+    const examsTaken = normalizedAttempts.filter(a => a.kind === "exam").length;
+
+    // Learning minutes: prefer explicit durations; otherwise heuristic
+    let totalLearningMinutes = 0;
+    for (const a of normalizedAttempts) {
+      if (a.durationMinutes != null) {
+        totalLearningMinutes += Number(a.durationMinutes);
+      } else {
+        if (a.kind === "exercise") totalLearningMinutes += 5;
+        else if (a.kind === "exam") totalLearningMinutes += 15;
+        else totalLearningMinutes += 10;
+      }
+    }
+    const learningHours = Number((totalLearningMinutes / 60).toFixed(2));
+
+    // weekly_exams
     const oneWeekAgo = new Date();
     oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
+    const weeklyExams = normalizedAttempts.filter(a => a.kind === "exam" && new Date(a.date) >= oneWeekAgo).length;
 
-    const stats = {
-      average_score: averageScore,
-      exams_taken: examAttempts.length,
-      exercises_done: exerciseAttempts.length,
-      learning_hours: learningHours,
-      weekly_exams: examAttempts.filter(
-        e => new Date(e.created_at) >= oneWeekAgo
-      ).length,
-      streak_days: calculateStreak(allAttempts),
-      daily_hours:
-        uniqueDays > 0
-          ? Number((learningHours / uniqueDays).toFixed(2))
-          : 0
-    };
+    // streak_days based on unique days with activity
+    const uniqueDays = Array.from(new Set(normalizedAttempts.map(a => new Date(a.date).toDateString())))
+      .map(d => new Date(d))
+      .sort((a, b) => b - a); // newest first
 
-    /* ================= SUBJECTS ================= */
-
-    const subjects = {};
-
-    const pushTrend = (label, percent) => {
-      subjects[label] ??= {
-        average_score: 0,
-        exercises: 0,
-        exams: 0,
-        trend: []
-      };
-      subjects[label].trend.push(percent);
-    };
-
-    exerciseAttempts.forEach(a => {
-      const raw = a.exercises?.subject?.toLowerCase();
-      const label = SUBJECT_KEY_TO_LABEL[raw];
-      if (!label) return;
-
-      subjects[label] ??= {
-        average_score: 0,
-        exercises: 0,
-        exams: 0,
-        trend: []
-      };
-
-      subjects[label].exercises++;
-      pushTrend(label, Math.round((a.score / a.total) * 100));
-    });
-
-    const examSubjectMap = {};
-    exams.forEach(e => {
-      const raw = e.subject?.toLowerCase();
-      if (SUBJECT_KEY_TO_LABEL[raw]) {
-        examSubjectMap[e.id] = SUBJECT_KEY_TO_LABEL[raw];
+    let streak_days = 0;
+    for (let i = 0; i < uniqueDays.length; i++) {
+      if (i === 0) streak_days = 1;
+      else {
+        const diff = (uniqueDays[i - 1] - uniqueDays[i]) / (1000 * 60 * 60 * 24);
+        if (diff === 1) streak_days++;
+        else break;
       }
-    });
+    }
 
-    examAttempts.forEach(a => {
-      const label = examSubjectMap[a.exam_id];
-      if (!label) return;
+    const daily_hours = uniqueDays.length > 0 ? Number((learningHours / uniqueDays.length).toFixed(2)) : Number(learningHours.toFixed(2));
 
-      subjects[label] ??= {
-        average_score: 0,
-        exercises: 0,
-        exams: 0,
-        trend: []
-      };
-
-      subjects[label].exams++;
-      pushTrend(label, Math.round((a.score / a.total) * 100));
-    });
-
-    Object.keys(subjects).forEach(label => {
-      const t = subjects[label].trend;
-      subjects[label].average_score =
-        t.length > 0
-          ? Math.round(t.reduce((a, b) => a + b, 0) / t.length)
-          : 0;
-    });
-
-    /* ================= ACHIEVEMENTS ================= */
-
+    // Achievements (expanded but non-hardcoded)
     const achievements = [];
+    if (streak_days >= 7) achievements.push({ title: "7-Day Streak", description: "Practiced for 7 consecutive days", icon: "zap", color: "green" });
+    if (averageScore >= 85) achievements.push({ title: "Top Performer", description: "Average score >= 85%", icon: "star", color: "purple" });
+    if (daily_hours >= 1) achievements.push({ title: "Consistent Learner", description: "Average study time >= 1 hour/day", icon: "calendar", color: "blue" });
+    if (exercisesDone >= 20) achievements.push({ title: "Frequent Performer", description: `Completed ${exercisesDone} exercises`, icon: "bolt", color: "orange" });
 
-    if (stats.streak_days >= 7) {
-      achievements.push({
-        title: "7-Day Streak",
-        description: "Practiced consistently for 7 days",
-        icon: "zap",
-        color: "green"
-      });
-    }
+    // Performance_data: labels = Attempt 1..N where N = max attempts among subjects
+    const maxLen = Math.max(0, ...Object.values(subjects).map(s => s.trend.length));
+    const labels = Array.from({ length: maxLen }, (_, i) => `Attempt ${i + 1}`);
 
-    if (stats.average_score >= 85) {
-      achievements.push({
-        title: "Top Performer",
-        description: "Excellent overall performance",
-        icon: "star",
-        color: "purple"
-      });
-    }
+    // Build datasets preserving subject order
+    const subjectLabels = Object.keys(subjects);
+    const datasets = subjectLabels.map((label, idx) => ({
+      subject: label,
+      data: subjects[label].trend,
+      color: COLOR_PALETTE[idx % COLOR_PALETTE.length]
+    }));
 
-    /* ================= PERFORMANCE GRAPH ================= */
-
-    const maxLen = Math.max(
-      ...Object.values(subjects).map(s => s.trend.length),
-      0
-    );
-
-    const performance_data = {
-      labels: Array.from({ length: maxLen }, (_, i) => `Attempt ${i + 1}`),
-      datasets: Object.keys(subjects).map(label => ({
-        subject: label,
-        data: subjects[label].trend,
-        color: SUBJECT_LABEL_TO_COLOR[label]
-      }))
-    };
-
-    /* ================= FINAL ================= */
-
-    res.json({
-      user,
-      stats,
+    // Final response
+    const progressData = {
+      user: {
+        id: userId,
+        name: `${profile.first_name || ""} ${profile.last_name || ""}`.trim(),
+        class: String(profile.class_level ?? ""),
+        board: profile.board ?? ""
+      },
+      stats: {
+        average_score: averageScore,
+        exams_taken: examsTaken,
+        exercises_done: exercisesDone,
+        learning_hours: learningHours,
+        weekly_exams: weeklyExams,
+        streak_days: streak_days,
+        daily_hours: daily_hours
+      },
       subjects,
       achievements,
-      performance_data
-    });
+      performance_data: {
+        labels,
+        datasets
+      }
+    };
 
+    res.json(progressData);
   } catch (err) {
     console.error("Progress error:", err);
     res.status(500).json({ error: "Failed to load progress" });
